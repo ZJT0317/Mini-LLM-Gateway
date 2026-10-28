@@ -1,0 +1,26 @@
+name: demo
+version: "1"
+status: published
+system: "You are {{ role }}."
+variables:
+  type: object
+  required: [role]
+  properties:
+    role:
+      type: string
+      maxLength: 40
+few_shot:
+  - role: user
+    content: Hello
+  - role: assistant
+    content: Hi
+output_schema: null
+tools: []
+default_model: gpt-4o-mini
+temperature: 0.2
+max_tokens: 256
+context_budget: 1000
+eval_set: null
+eval_threshold: null
+changelog: initial
+schema_version: "1"
