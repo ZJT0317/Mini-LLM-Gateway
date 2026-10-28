@@ -1,0 +1,12 @@
+services:
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      GATEWAY_DEMO_KEY: ${GATEWAY_DEMO_KEY}
+    volumes:
+      - ./gateway.yaml:/srv/gateway.yaml:ro
+      - ./prompts:/srv/prompts:ro
+    command: ["mini-llm-gateway", "--config", "/srv/gateway.yaml"]

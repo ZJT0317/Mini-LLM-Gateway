@@ -1,0 +1,51 @@
+server:
+  addr: "0.0.0.0:8080"
+  gateway_timeout: 60s
+  max_body_bytes: 1048576
+  shutdown_grace: 15s
+
+limits:
+  max_tokens_cap: 4096
+  retry_max_attempts: 2
+  repair_max_attempts: 1
+
+log:
+  level: info
+  debug_payload: false
+  payload_max_runes: 200
+
+providers:
+  - name: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    upstream_timeout: 90s
+    allowed_hosts:
+      - api.openai.com
+    capabilities:
+      - streaming
+      - structured_output
+      - tool_calling
+
+models:
+  - logical_model: gpt-4o-mini
+    provider: openai
+    resolved_model: gpt-4o-mini
+    priority: 1
+    input_cost_per_million: "0.15"
+    output_cost_per_million: "0.60"
+    capabilities:
+      - streaming
+      - structured_output
+      - tool_calling
+
+keys:
+  - id: demo
+    secret_env: GATEWAY_DEMO_KEY
+    tenant_id: demo
+    status: active
+    rpm: 60
+    max_concurrency: 4
+    allowed_models: []
+
+prompts:
+  directory: ./prompts
