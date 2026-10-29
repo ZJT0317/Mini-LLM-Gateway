@@ -3,7 +3,6 @@ import json
 from datetime import timedelta
 
 import httpx
-import pytest
 
 from app.core.errors import Code, GatewayError, Stage
 from app.core.models import Capability, EventKind, GatewayEvent, ModelSpec
@@ -46,7 +45,8 @@ async def test_chat_and_models(tmp_path):
     body = response.json()
     assert body["model"] == "demo"
     assert body["choices"][0]["message"]["content"] == "hello"
-    assert "usage" not in body
+    assert body["usage"]["total_tokens"] == 4
+    assert body["created"] > 0
     assert response.headers["x-request-id"]
     rows = app.state.ledger.calls_by_trace(response.headers["x-request-id"])
     assert rows[0]["requested_model"] == "demo"

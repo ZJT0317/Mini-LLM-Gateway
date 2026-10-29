@@ -8,6 +8,8 @@ limits:
   max_tokens_cap: 4096
   retry_max_attempts: 2
   repair_max_attempts: 1
+  circuit_failure_threshold: 3
+  circuit_cooldown: 30s
 
 log:
   level: info

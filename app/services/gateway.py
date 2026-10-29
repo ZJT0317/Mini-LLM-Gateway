@@ -1,46 +1,64 @@
-"""Orchestrate prompt rendering, admission, routing, execution, and the ledger."""
+"""Execute calls with one lifecycle, deadline, and ledger entry per attempt."""
 
 from __future__ import annotations
 
+import asyncio
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta
+from typing import Literal
 
-from app.core.admission import AdmissionGate, Admit, budget_is_usable
+import anyio
+
+from app.core.admission import AdmissionGate, Admit, Release, budget_is_usable
 from app.core.auth import ensure_model_visible
-from app.core.errors import Code, GatewayError, Stage, http_status
+from app.core.errors import Code, GatewayError, Stage
 from app.core.models import (
     APIKey,
+    AdapterOutcome,
     EventKind,
     GatewayEvent,
     Invocation,
     Message,
     ModelSpec,
-    PromptUse,
     Terminal,
-    TokenUsage,
+    ToolCall,
     UnifiedResult,
     UpstreamCall,
-    estimate_tokens,
-    price_usage,
+    ValidationResult,
 )
 from app.core.retry import backoff, should_fallback, should_retry
+from app.services.accounting import CallRecorder, attempt_usage
+from app.services.execution import AttemptKind, AttemptState, CallState
 from app.services.metrics import Metrics
-from app.services.prompts import PreparedCall, PromptLibrary
+from app.services.prompts import PromptLibrary
 from app.services.router import AdapterRegistry, HealthBoard, Router
-from app.services.structured import validate_json
-from app.services.usage import AttemptRow, CallRow, Ledger
+from app.services.structured import check_schema, validate_json
+from app.services.usage import Ledger
 
 Sleeper = Callable[[timedelta], Awaitable[None]]
 Rng = Callable[[], float]
+RetryAction = Literal["retry", "fallback"]
 
 
-class _Run:
-    def __init__(self, started: float) -> None:
-        self.started = started
-        self.prepared: PreparedCall | None = None
-        self.spec: ModelSpec | None = None
-        self.saved = False
+@asynccontextmanager
+async def _closing(
+    iterator: AsyncGenerator[GatewayEvent, None],
+) -> AsyncIterator[AsyncGenerator[GatewayEvent, None]]:
+    try:
+        yield iterator
+    finally:
+        # Starlette disconnects cancel an AnyIO scope. Finish resource cleanup in it.
+        with anyio.CancelScope(shield=True):
+            await iterator.aclose()
+
+
+def _timeout() -> GatewayError:
+    return GatewayError(
+        Code.UPSTREAM_OVERLOADED, "gateway timeout", stage=Stage.BEFORE_FIRST_TOKEN
+    )
 
 
 class GatewayService:
@@ -66,8 +84,7 @@ class GatewayService:
         self._router = router
         self._registry = registry
         self._health = health
-        self._ledger = ledger
-        self._metrics = metrics
+        self._recorder = CallRecorder(ledger, metrics)
         self._clock = clock
         self._sleeper = sleeper
         self._rng = rng
@@ -76,600 +93,539 @@ class GatewayService:
         self._max_tokens_cap = max_tokens_cap
 
     async def complete(self, invocation: Invocation, key: APIKey) -> UnifiedResult:
-        started = time.monotonic()
-        run = _Run(started)
+        run = CallState(invocation)
         release = None
         try:
-            prepared, release, queue_ms = await self._open(invocation, key)
-            run.prepared = prepared
-            async with asyncio_timeout(prepared.invocation.timeout):
-                return await self._complete(run, queue_ms)
+            async with asyncio.timeout_at(run.deadline):
+                release = await self._open(run, key)
+            result = await self._complete(run)
+            self._recorder.record_call(run, result.terminal, result=result)
+            return result
         except TimeoutError as exc:
-            error = GatewayError(
-                Code.UPSTREAM_OVERLOADED,
-                "gateway timeout",
-                stage=Stage.BEFORE_FIRST_TOKEN,
-                cause=exc,
-            )
-            self._save_failure(run, invocation, error, 504, None)
+            error = _timeout()
+            self._recorder.record_call(run, Terminal.ERROR, error=error)
             raise error from exc
         except GatewayError as exc:
-            self._save_failure(run, invocation, exc, http_status(exc)[0], None)
+            self._recorder.record_call(run, Terminal.ERROR, error=exc)
             raise
+        except (asyncio.CancelledError, GeneratorExit):
+            self._recorder.record_call(run, Terminal.CANCELED)
+            raise
+        except Exception as exc:
+            error = GatewayError(
+                Code.INTERNAL, "internal error", stage=Stage.OUTPUT, cause=exc
+            )
+            self._recorder.record_call(run, Terminal.ERROR, error=error)
+            raise error from exc
         finally:
             if release is not None:
-                await release()
+                with anyio.CancelScope(shield=True):
+                    await release()
 
-    async def stream(self, invocation: Invocation, key: APIKey) -> AsyncIterator[GatewayEvent]:
-        started = time.monotonic()
-        run = _Run(started)
+    async def stream(
+        self, invocation: Invocation, key: APIKey
+    ) -> AsyncGenerator[GatewayEvent, None]:
+        run = CallState(invocation)
         release = None
         try:
-            prepared, release, queue_ms = await self._open(invocation, key)
-            run.prepared = prepared
-            async with asyncio_timeout(prepared.invocation.timeout):
-                async for event in self._stream(run, queue_ms):
-                    yield event
-        except TimeoutError as exc:
-            error = GatewayError(
-                Code.UPSTREAM_OVERLOADED,
-                "gateway timeout",
-                stage=Stage.BEFORE_FIRST_TOKEN,
-                cause=exc,
-            )
-            self._save_failure(run, invocation, error, 504, None)
-            raise error from exc
+            async with asyncio.timeout_at(run.deadline):
+                release = await self._open(run, key)
+            async with _closing(self._stream(run)) as events:
+                async for event in events:
+                    yield replace(event, requested_model=run.invocation.requested_model)
+        except TimeoutError:
+            error = _timeout()
+            self._recorder.record_call(run, Terminal.ERROR, error=error)
+            yield GatewayEvent(kind=EventKind.ERROR, error=error)
         except GatewayError as exc:
-            self._save_failure(run, invocation, exc, http_status(exc)[0], None)
+            self._recorder.record_call(run, Terminal.ERROR, error=exc)
+            yield GatewayEvent(kind=EventKind.ERROR, error=exc)
+        except (asyncio.CancelledError, GeneratorExit):
+            self._recorder.record_call(run, Terminal.CANCELED)
             raise
+        except Exception as exc:
+            error = GatewayError(
+                Code.INTERNAL, "internal error", stage=Stage.OUTPUT, cause=exc
+            )
+            self._recorder.record_call(run, Terminal.ERROR, error=error)
+            yield GatewayEvent(kind=EventKind.ERROR, error=error)
         finally:
             if release is not None:
-                await release()
+                with anyio.CancelScope(shield=True):
+                    await release()
 
-    async def _open(
-        self,
-        invocation: Invocation,
-        key: APIKey,
-    ) -> tuple[PreparedCall, Callable[[], Awaitable[None]], float]:
-        self._check_limits(invocation)
-        prepared = self._prompts.prepare(invocation)
-        ensure_model_visible(key, prepared.invocation.requested_model)
-        if not budget_is_usable(prepared.invocation.timeout):
+    async def _open(self, run: CallState, key: APIKey) -> Release | None:
+        run.prepared = self._prompts.prepare(run.original)
+        invocation = run.invocation
+        ensure_model_visible(key, invocation.requested_model)
+        if invocation.max_tokens is None:
+            invocation = replace(invocation, max_tokens=self._max_tokens_cap)
+            run.prepared = replace(run.prepared, invocation=invocation)
+        if (
+            isinstance(invocation.max_tokens, bool)
+            or not isinstance(invocation.max_tokens, int)
+            or not 1 <= invocation.max_tokens <= self._max_tokens_cap
+        ):
             raise GatewayError(
-                Code.DEADLINE_TOO_SHORT,
-                "deadline too short",
-                stage=Stage.ADMISSION,
+                Code.INVALID_REQUEST, "max_tokens exceeds cap", stage=Stage.VALIDATION
             )
-        queue_started = time.monotonic()
-        status, release = await self._admission.acquire(
-            key.id,
-            key.rpm,
-            key.max_concurrency,
-            self._clock(),
-        )
-        queue_ms = (time.monotonic() - queue_started) * 1000
-        if status == Admit.CONCURRENCY or release is None and status != Admit.OK:
-            if status == Admit.RATE:
+        if invocation.temperature is not None and (
+            isinstance(invocation.temperature, bool)
+            or not isinstance(invocation.temperature, (int, float))
+            or not 0 <= invocation.temperature <= 2
+        ):
+            raise GatewayError(
+                Code.INVALID_REQUEST, "invalid temperature", stage=Stage.VALIDATION
+            )
+        if invocation.json_schema is not None:
+            check_schema(invocation.json_schema)
+        for tool in invocation.tools:
+            check_schema(tool.parameters)
+        choice = invocation.tool_choice
+        if choice is not None:
+            if not invocation.tools:
                 raise GatewayError(
-                    Code.ADMISSION_REJECTED,
-                    "rate limit exceeded",
-                    stage=Stage.ADMISSION,
+                    Code.INVALID_REQUEST,
+                    "tool_choice requires tools",
+                    stage=Stage.VALIDATION,
+                )
+            if isinstance(choice, dict) and choice["function"]["name"] not in {
+                t.name for t in invocation.tools
+            }:
+                raise GatewayError(
+                    Code.INVALID_REQUEST,
+                    "tool_choice names an unknown tool",
+                    stage=Stage.VALIDATION,
+                )
+        if not budget_is_usable(invocation.timeout):
+            raise GatewayError(
+                Code.DEADLINE_TOO_SHORT, "deadline too short", stage=Stage.ADMISSION
+            )
+        queued = time.monotonic()
+        status, release = await self._admission.acquire(
+            key.id, key.rpm, key.max_concurrency, self._clock()
+        )
+        run.queue_ms = (time.monotonic() - queued) * 1000
+        if status != Admit.OK:
+            message = (
+                "rate limit exceeded"
+                if status == Admit.RATE
+                else "concurrency limit exceeded"
+            )
+            raise GatewayError(Code.ADMISSION_REJECTED, message, stage=Stage.ADMISSION)
+        return release
+
+    def _route(self, run: CallState) -> tuple[ModelSpec, ...]:
+        started = time.monotonic()
+        decision = self._router.decide(
+            run.invocation.requested_model, run.invocation.required
+        )
+        run.route_ms = (time.monotonic() - started) * 1000
+        self._recorder.record_rejections(run.invocation.call_id, decision.rejections)
+        if not decision.candidates:
+            if any(item.reason == "unhealthy" for item in decision.rejections):
+                raise GatewayError(
+                    Code.MODEL_UNAVAILABLE,
+                    "model temporarily unavailable",
+                    stage=Stage.ROUTING,
                 )
             raise GatewayError(
-                Code.ADMISSION_REJECTED,
-                "concurrency limit exceeded",
-                stage=Stage.ADMISSION,
+                Code.NO_COMPATIBLE_MODEL, "model not found", stage=Stage.ROUTING
             )
-        assert release is not None
-        return prepared, release, queue_ms
+        return decision.candidates
 
-    def _check_limits(self, invocation: Invocation) -> None:
-        if invocation.max_tokens is not None and invocation.max_tokens > self._max_tokens_cap:
-            raise GatewayError(
-                Code.INVALID_REQUEST,
-                "max_tokens exceeds cap",
-                stage=Stage.VALIDATION,
-            )
-
-    def _route(self, invocation: Invocation):
-        route_started = time.monotonic()
-        decision = self._router.decide(invocation.requested_model, invocation.required)
-        route_ms = (time.monotonic() - route_started) * 1000
-        for rejection in decision.rejections:
-            self._ledger.save_rejection(
-                invocation.call_id,
-                rejection.provider,
-                rejection.resolved_model,
-                rejection.reason,
-            )
-        if not decision.candidates:
-            raise GatewayError(Code.NO_COMPATIBLE_MODEL, "model not found", stage=Stage.ROUTING)
-        return decision, route_ms
-
-    async def _classify_failure(
+    @asynccontextmanager
+    async def _attempt(
         self,
-        *,
-        error: GatewayError,
-        invocation: Invocation,
+        run: CallState,
         spec: ModelSpec,
-        attempt: int,
-        tries: int,
-        index: int,
-        business: bool,
-        remaining: int,
-        queue_ms: float,
-        route_ms: float,
-        started: float,
-    ) -> str:
-        if error.stage == Stage.OUTPUT:
-            return "raise"
-        self._health.record(spec, success=False)
-        if business:
-            return "stop"
-        self._save_attempt(
-            invocation,
+        *,
+        kind: AttemptKind = "generation",
+        is_retry: bool = False,
+        is_fallback: bool = False,
+        messages: tuple[Message, ...] | None = None,
+    ) -> AsyncIterator[AttemptState]:
+        run.spec = spec
+        attempt = AttemptState(
             spec,
-            attempt,
-            is_retry=tries > 1,
-            is_fallback=index > 0,
-            queue_ms=queue_ms,
-            route_ms=route_ms,
-            ttft_ms=None,
-            total_ms=(time.monotonic() - started) * 1000,
-            usage=TokenUsage(0, 0),
-            finish_reason="",
-            terminal=Terminal.ERROR,
-            error_code=error.code.value,
-            provider_request_id=error.provider_request_id or "",
+            len(run.attempts) + 1,
+            time.monotonic(),
+            run.invocation.messages if messages is None else messages,
+            kind,
+            is_retry,
+            is_fallback,
+            max(0, min(run.deadline - time.monotonic(), spec.timeout.total_seconds()))
+            * 1000,
         )
-        if should_retry(error.stage, error.code, tries, self._max_attempts, False):
-            await self._sleeper(backoff(tries, self._rng()))
-            return "retry"
-        if should_fallback(error.code, False, remaining):
-            return "fallback"
-        return "raise"
+        run.active = attempt
+        try:
+            yield attempt
+        except (asyncio.CancelledError, GeneratorExit):
+            self._health.release(spec)
+            self._recorder.record_attempt(run, Terminal.CANCELED, Code.CANCELED.value)
+            raise
+        except TimeoutError as exc:
+            self._health.record(spec, success=False)
+            self._recorder.record_attempt(
+                run, Terminal.ERROR, Code.UPSTREAM_OVERLOADED.value
+            )
+            raise _timeout() from exc
+        except GatewayError as exc:
+            attempt.provider_request_id = (
+                exc.provider_request_id or attempt.provider_request_id
+            )
+            if exc.code in {
+                Code.UPSTREAM_UNAVAILABLE,
+                Code.UPSTREAM_OVERLOADED,
+                Code.UPSTREAM_ERROR,
+            }:
+                self._health.record(spec, success=False)
+            else:
+                self._health.release(spec)
+            self._recorder.record_attempt(
+                run,
+                Terminal.REFUSED if attempt.refusal else Terminal.ERROR,
+                Code.CONTENT_REJECTED.value if attempt.refusal else exc.code.value,
+            )
+            raise
+        except Exception as exc:
+            self._health.release(spec)
+            self._recorder.record_attempt(run, Terminal.ERROR, Code.INTERNAL.value)
+            raise GatewayError(
+                Code.INTERNAL, "internal error", stage=Stage.OUTPUT, cause=exc
+            ) from exc
+        else:
+            self._health.record(spec, success=True)
+            invalid = attempt.validation is not None and not attempt.validation.ok
+            self._recorder.record_attempt(
+                run,
+                Terminal.REFUSED
+                if attempt.refusal
+                else Terminal.ERROR
+                if invalid
+                else Terminal.COMPLETED,
+                Code.CONTENT_REJECTED.value
+                if attempt.refusal
+                else Code.OUTPUT_INVALID.value
+                if invalid
+                else "",
+            )
 
-    def _save_failure(
+    async def _invoke(
         self,
-        run: _Run,
-        invocation: Invocation,
-        error: GatewayError,
-        status: int,
-        ttft_ms: float | None,
-    ) -> None:
-        if run.saved:
-            return
-        source = invocation if run.prepared is None else run.prepared.invocation
-        prompt = None if run.prepared is None else run.prepared.prompt
-        if prompt is None and source.prompt_ref is not None:
-            prompt = PromptUse(source.prompt_ref.name, source.prompt_ref.version, "", "")
-        self._save_call(run, source, prompt, error, ttft_ms, status)
-
-    async def _complete(self, run: _Run, queue_ms: float) -> UnifiedResult:
-        assert run.prepared is not None
-        prepared = run.prepared
-        invocation = prepared.invocation
-        started = run.started
-        decision, route_ms = self._route(invocation)
-        attempt = 0
-        for index, spec in enumerate(decision.candidates):
-            tries = 0
-            while True:
-                tries += 1
-                attempt += 1
-                run.spec = spec
-                call = _upstream_call(invocation, spec)
-                try:
-                    outcome = await self._registry.adapter_for(spec.provider).invoke(call)
-                    self._health.record(spec, success=True)
-                    usage = outcome.usage or estimate_tokens(invocation.messages, outcome.content)
-                    content = outcome.content
-                    validation = None
-                    if invocation.json_schema is not None:
-                        content, validation, attempt = await self._repair(
-                            invocation,
-                            spec,
-                            content,
-                            attempt,
-                            queue_ms,
-                            route_ms,
-                            started,
-                        )
-                    result = UnifiedResult(
-                        requested_model=invocation.requested_model,
-                        resolved_model=spec.resolved_model,
-                        provider=spec.provider,
-                        content=content,
-                        tool_calls=outcome.tool_calls,
-                        finish_reason=outcome.finish_reason,
-                        terminal=Terminal.COMPLETED,
-                        usage=usage,
-                        validation=validation,
-                        provider_request_id=outcome.provider_request_id,
-                    )
-                    total_ms = (time.monotonic() - started) * 1000
-                    self._save_attempt(
-                        invocation,
-                        spec,
-                        attempt,
-                        is_retry=tries > 1,
-                        is_fallback=index > 0,
-                        queue_ms=queue_ms,
-                        route_ms=route_ms,
-                        ttft_ms=None,
-                        total_ms=total_ms,
-                        usage=usage,
-                        finish_reason=result.finish_reason,
-                        terminal=Terminal.COMPLETED,
-                        error_code="",
-                        provider_request_id=outcome.provider_request_id or "",
-                    )
-                    self._save_success(run, result, None)
-                    return result
-                except GatewayError as error:
-                    action = await self._classify_failure(
-                        error=error,
-                        invocation=invocation,
-                        spec=spec,
-                        attempt=attempt,
-                        tries=tries,
-                        index=index,
-                        business=False,
-                        remaining=len(decision.candidates) - index - 1,
-                        queue_ms=queue_ms,
-                        route_ms=route_ms,
-                        started=started,
-                    )
-                    if action == "retry":
-                        continue
-                    if action == "fallback":
-                        break
-                    raise
-        raise GatewayError(Code.UPSTREAM_ERROR, "upstream request failed", stage=Stage.BEFORE_FIRST_TOKEN)
+        run: CallState,
+        spec: ModelSpec,
+        *,
+        kind: AttemptKind = "generation",
+        is_retry: bool = False,
+        is_fallback: bool = False,
+        messages: tuple[Message, ...] | None = None,
+    ) -> tuple[AdapterOutcome, ValidationResult | None, str]:
+        async with self._attempt(
+            run,
+            spec,
+            kind=kind,
+            is_retry=is_retry,
+            is_fallback=is_fallback,
+            messages=messages,
+        ) as attempt:
+            async with asyncio.timeout_at(run.deadline):
+                outcome = await self._registry.adapter_for(spec.provider).invoke(
+                    self._upstream_call(run, spec, attempt.messages)
+                )
+            attempt.received = True
+            attempt.content = outcome.content
+            attempt.tools = {tool.index: tool for tool in outcome.tool_calls}
+            attempt.usage = outcome.usage
+            attempt.finish_reason = outcome.finish_reason
+            attempt.provider_request_id = outcome.provider_request_id or ""
+            attempt.refusal = outcome.refusal or ""
+            canonical = outcome.content
+            if (
+                run.invocation.json_schema is not None
+                and not outcome.tool_calls
+                and not outcome.refusal
+            ):
+                attempt.validation, canonical = validate_json(
+                    outcome.content, run.invocation.json_schema
+                )
+            validation = attempt.validation
+            usage = attempt_usage(attempt)
+            outcome = replace(outcome, usage=usage)
+        return outcome, validation, canonical
 
     async def _repair(
-        self,
-        invocation: Invocation,
-        spec: ModelSpec,
-        content: str,
-        attempt: int,
-        queue_ms: float,
-        route_ms: float,
-        started: float,
-    ) -> tuple[str, object, int]:
-        assert invocation.json_schema is not None
-        validation, canonical = validate_json(content, invocation.json_schema)
-        if validation.ok:
-            return canonical, validation, attempt
-        current = content
-        repairs = 0
-        while repairs < self._repair_max_attempts:
-            repairs += 1
-            attempt += 1
-            messages = invocation.messages + (
-                Message("assistant", current),
+        self, run: CallState, spec: ModelSpec, content: str
+    ) -> tuple[AdapterOutcome, ValidationResult | None, str]:
+        for _ in range(self._repair_max_attempts):
+            if not self._health.acquire(spec):
+                raise GatewayError(
+                    Code.MODEL_UNAVAILABLE,
+                    "model temporarily unavailable",
+                    stage=Stage.ROUTING,
+                )
+            messages = run.invocation.messages + (
+                Message("assistant", content),
                 Message("user", "Return only JSON that matches the requested schema."),
             )
-            repaired = await self._registry.adapter_for(spec.provider).invoke(
-                _upstream_call(invocation, spec, messages=messages)
+            outcome, validation, canonical = await self._invoke(
+                run, spec, kind="repair", messages=messages
             )
-            current = repaired.content
-            validation, canonical = validate_json(current, invocation.json_schema)
-            usage = repaired.usage or estimate_tokens(messages, current)
-            self._save_attempt(
-                invocation,
-                spec,
-                attempt,
-                is_retry=True,
-                is_fallback=False,
-                queue_ms=queue_ms,
-                route_ms=route_ms,
-                ttft_ms=None,
-                total_ms=(time.monotonic() - started) * 1000,
-                usage=usage,
-                finish_reason=repaired.finish_reason,
-                terminal=Terminal.COMPLETED if validation.ok else Terminal.ERROR,
-                error_code="" if validation.ok else Code.OUTPUT_INVALID.value,
-                provider_request_id=repaired.provider_request_id or "",
-            )
-            if validation.ok:
-                return canonical, validation, attempt
+            if outcome.refusal or (validation is not None and validation.ok):
+                return outcome, validation, canonical
+            content = outcome.content
         raise GatewayError(
-            Code.OUTPUT_INVALID,
-            "output validation failed",
-            stage=Stage.OUTPUT,
+            Code.OUTPUT_INVALID, "output validation failed", stage=Stage.OUTPUT
         )
 
-    async def _stream(self, run: _Run, queue_ms: float) -> AsyncIterator[GatewayEvent]:
-        assert run.prepared is not None
-        prepared = run.prepared
-        invocation = prepared.invocation
-        started = run.started
-        decision, route_ms = self._route(invocation)
-        attempt = 0
-        for index, spec in enumerate(decision.candidates):
-            tries = 0
-            while True:
-                tries += 1
-                attempt += 1
-                run.spec = spec
-                call = _upstream_call(invocation, spec)
-                business = False
-                ttft_ms: float | None = None
-                parts: list[str] = []
-                usage: TokenUsage | None = None
+    async def _retry(
+        self, run: CallState, error: GatewayError, tries: int, remaining: int
+    ) -> RetryAction:
+        if time.monotonic() >= run.deadline or error.message == "gateway timeout":
+            raise _timeout()
+        # A failed repair must not restart generation and reset the repair budget.
+        if run.attempts and run.attempts[-1].kind == "repair":
+            raise error
+        if run.attempts and run.attempts[-1].terminal == Terminal.REFUSED.value:
+            raise error
+        if should_retry(error.stage, error.code, tries, self._max_attempts, run.sent):
+            async with asyncio.timeout_at(run.deadline):
+                await self._sleeper(backoff(tries, self._rng()))
+            return "retry"
+        if should_fallback(error.code, run.sent, remaining):
+            return "fallback"
+        raise error
+
+    async def _complete(self, run: CallState) -> UnifiedResult:
+        candidates = self._route(run)
+        for index, spec in enumerate(candidates):
+            for tries in range(1, self._max_attempts + 1):
+                if not self._health.acquire(spec):
+                    break
                 try:
-                    async for event in self._registry.adapter_for(spec.provider).stream(call):
-                        if event.kind is EventKind.ERROR and not business:
-                            error = event.error
-                            if isinstance(error, GatewayError):
-                                raise error
-                            raise GatewayError(
-                                Code.UPSTREAM_ERROR,
-                                "upstream request failed",
-                                stage=Stage.STREAMING,
-                            )
-                        if event.kind in {EventKind.DELTA, EventKind.TOOL_CALL} and ttft_ms is None:
-                            ttft_ms = (time.monotonic() - started) * 1000
-                            business = True
-                        if event.kind is EventKind.DELTA:
-                            parts.append(event.text)
-                        if event.kind is EventKind.USAGE and event.usage is not None:
-                            usage = event.usage
-                            continue
-                        if invocation.json_schema is None and business:
-                            yield event
-                        if event.kind is EventKind.DONE:
-                            content = "".join(parts)
-                            validation = None
-                            if invocation.json_schema is not None:
-                                content, validation, attempt = await self._repair(
-                                    invocation,
-                                    spec,
-                                    content,
-                                    attempt,
-                                    queue_ms,
-                                    route_ms,
-                                    started,
-                                )
-                                yield GatewayEvent(kind=EventKind.DELTA, text=content)
-                            elif not business:
-                                yield event
-                            final_usage = usage or estimate_tokens(invocation.messages, content)
-                            result = UnifiedResult(
-                                requested_model=invocation.requested_model,
-                                resolved_model=spec.resolved_model,
-                                provider=spec.provider,
-                                content=content,
-                                tool_calls=(),
-                                finish_reason="stop",
-                                terminal=Terminal.COMPLETED,
-                                usage=final_usage,
-                                validation=validation,
-                                provider_request_id=None,
-                            )
-                            self._health.record(spec, success=True)
-                            self._save_attempt(
-                                invocation,
-                                spec,
-                                attempt,
-                                is_retry=tries > 1,
-                                is_fallback=index > 0,
-                                queue_ms=queue_ms,
-                                route_ms=route_ms,
-                                ttft_ms=ttft_ms,
-                                total_ms=(time.monotonic() - started) * 1000,
-                                usage=final_usage,
-                                finish_reason="stop",
-                                terminal=Terminal.COMPLETED,
-                                error_code="",
-                                provider_request_id="",
-                            )
-                            self._save_success(run, result, ttft_ms)
-                            if invocation.json_schema is not None:
-                                yield GatewayEvent(kind=EventKind.DONE)
-                            return
-                    raise GatewayError(
-                        Code.UPSTREAM_ERROR,
-                        "upstream request failed",
-                        stage=Stage.STREAMING,
+                    outcome, validation, content = await self._invoke(
+                        run,
+                        spec,
+                        is_retry=tries > 1,
+                        is_fallback=index > 0,
                     )
+                    if validation is not None and not validation.ok:
+                        outcome, validation, content = await self._repair(
+                            run, spec, outcome.content
+                        )
+                    return self._result(run, spec, outcome, validation, content)
                 except GatewayError as error:
-                    action = await self._classify_failure(
-                        error=error,
-                        invocation=invocation,
-                        spec=spec,
-                        attempt=attempt,
-                        tries=tries,
-                        index=index,
-                        business=business,
-                        remaining=len(decision.candidates) - index - 1,
-                        queue_ms=queue_ms,
-                        route_ms=route_ms,
-                        started=started,
-                    )
-                    if action == "stop":
-                        yield GatewayEvent(kind=EventKind.ERROR, error=error)
-                        self._save_call(run, invocation, prepared.prompt, error, ttft_ms, 200)
-                        return
-                    if action == "retry":
-                        continue
-                    if action == "fallback":
+                    if (
+                        await self._retry(
+                            run, error, tries, len(candidates) - index - 1
+                        )
+                        == "fallback"
+                    ):
                         break
-                    raise
-
-    def _save_success(self, run: _Run, result: UnifiedResult, ttft_ms: float | None) -> None:
-        assert run.prepared is not None
-        prepared = run.prepared
-        started = run.started
-        invocation = prepared.invocation
-        prompt = prepared.prompt
-        cost = price_usage(result.usage, _spec_for(self._registry, result))
-        validation_ok = None if result.validation is None else int(result.validation.ok)
-        self._ledger.save_call(
-            CallRow(
-                call_id=invocation.call_id,
-                trace_id=invocation.trace_id,
-                run_id=invocation.run_id,
-                step_id=invocation.step_id,
-                requested_model=invocation.requested_model,
-                provider=result.provider,
-                resolved_model=result.resolved_model,
-                tenant_id=invocation.tenant_id,
-                key_id=invocation.key_id,
-                prompt_name="" if prompt is None else prompt.name,
-                prompt_version="" if prompt is None else prompt.version,
-                prompt_hash="" if prompt is None else prompt.content_hash,
-                schema_version="" if prompt is None else prompt.schema_version,
-                terminal=result.terminal.value,
-                http_status=200,
-                error_code="",
-                finish_reason=result.finish_reason,
-                validation_ok=validation_ok,
-                ttft_ms=ttft_ms,
-                total_ms=(time.monotonic() - started) * 1000,
-                input_tokens=result.usage.input_tokens,
-                output_tokens=result.usage.output_tokens,
-                cached_tokens=result.usage.cached_tokens,
-                reasoning_tokens=result.usage.reasoning_tokens,
-                estimated=result.usage.estimated,
-                cost_total=str(cost.total),
-            )
-        )
-        run.saved = True
-        self._metrics.observe(
-            invocation.requested_model,
-            result.provider,
-            result.terminal.value,
-            (time.monotonic() - started) * 1000,
+        raise GatewayError(
+            Code.MODEL_UNAVAILABLE, "model temporarily unavailable", stage=Stage.ROUTING
         )
 
-    def _save_call(
-        self,
-        run: _Run,
-        invocation: Invocation,
-        prompt: PromptUse | None,
-        error: GatewayError,
-        ttft_ms: float | None,
-        status: int,
-    ) -> None:
-        spec = run.spec
-        self._ledger.save_call(
-            CallRow(
-                call_id=invocation.call_id,
-                trace_id=invocation.trace_id,
-                run_id=invocation.run_id,
-                step_id=invocation.step_id,
-                requested_model=invocation.requested_model,
-                provider="" if spec is None else spec.provider,
-                resolved_model="" if spec is None else spec.resolved_model,
-                tenant_id=invocation.tenant_id,
-                key_id=invocation.key_id,
-                prompt_name="" if prompt is None else prompt.name,
-                prompt_version="" if prompt is None else prompt.version,
-                prompt_hash="" if prompt is None else prompt.content_hash,
-                schema_version="" if prompt is None else prompt.schema_version,
-                terminal=Terminal.ERROR.value,
-                http_status=status,
-                error_code=error.code.value,
-                finish_reason="",
-                validation_ok=None,
-                ttft_ms=ttft_ms,
-                total_ms=(time.monotonic() - run.started) * 1000,
-                input_tokens=0,
-                output_tokens=0,
-                cached_tokens=0,
-                reasoning_tokens=0,
-                estimated=False,
-                cost_total="0",
-            )
-        )
-        run.saved = True
-        provider = "" if spec is None else spec.provider
-        self._metrics.observe(
-            invocation.requested_model,
-            provider,
-            Terminal.ERROR.value,
-            (time.monotonic() - run.started) * 1000,
+    async def _stream(self, run: CallState) -> AsyncGenerator[GatewayEvent, None]:
+        candidates = self._route(run)
+        for index, spec in enumerate(candidates):
+            for tries in range(1, self._max_attempts + 1):
+                if not self._health.acquire(spec):
+                    break
+                try:
+                    async with self._attempt(
+                        run, spec, is_retry=tries > 1, is_fallback=index > 0
+                    ) as attempt:
+                        source = self._registry.adapter_for(spec.provider).stream(
+                            self._upstream_call(run, spec, attempt.messages)
+                        )
+                        async with _closing(source):
+                            while True:
+                                # Never keep a task-owned timeout context open across yield.
+                                async with asyncio.timeout_at(run.deadline):
+                                    try:
+                                        event = await anext(source)
+                                    except StopAsyncIteration as exc:
+                                        raise GatewayError(
+                                            Code.UPSTREAM_UNAVAILABLE,
+                                            "upstream request failed",
+                                            stage=Stage.STREAMING,
+                                            retryable=True,
+                                        ) from exc
+                                attempt.provider_request_id = (
+                                    event.provider_request_id
+                                    or attempt.provider_request_id
+                                )
+                                if event.kind is EventKind.ERROR:
+                                    if isinstance(event.error, GatewayError):
+                                        raise event.error
+                                    raise GatewayError(
+                                        Code.UPSTREAM_ERROR,
+                                        "upstream request failed",
+                                        stage=Stage.STREAMING,
+                                    )
+                                if event.kind is EventKind.USAGE:
+                                    attempt.usage = event.usage
+                                elif event.kind is EventKind.FINISH:
+                                    attempt.finish_reason = event.finish_reason or ""
+                                elif event.kind is EventKind.DONE:
+                                    attempt.received = True
+                                    attempt.finish_reason = (
+                                        event.finish_reason
+                                        or attempt.finish_reason
+                                        or "stop"
+                                    )
+                                    if (
+                                        attempt.finish_reason == "content_filter"
+                                        and not attempt.refusal
+                                    ):
+                                        attempt.refusal = "content rejected"
+                                    break
+                                elif event.kind in {
+                                    EventKind.DELTA,
+                                    EventKind.TOOL_CALL,
+                                    EventKind.REFUSAL,
+                                }:
+                                    attempt.received = True
+                                    if attempt.ttft_ms is None:
+                                        attempt.ttft_ms = (
+                                            time.monotonic() - attempt.started
+                                        ) * 1000
+                                    if event.kind is EventKind.DELTA:
+                                        attempt.content += event.text
+                                    elif event.kind is EventKind.REFUSAL:
+                                        attempt.refusal += event.text
+                                    elif event.tool_call is not None:
+                                        _merge_tool(attempt.tools, event.tool_call)
+                                    if run.invocation.json_schema is None:
+                                        self._mark_sent(run)
+                                        if event.kind is EventKind.REFUSAL:
+                                            attempt.refusal_emitted = True
+                                        yield event
+                        content = attempt.content
+                        if (
+                            run.invocation.json_schema is not None
+                            and not attempt.tools
+                            and not attempt.refusal
+                        ):
+                            attempt.validation, content = validate_json(
+                                content, run.invocation.json_schema
+                            )
+                        validation = attempt.validation
+                        outcome = AdapterOutcome(
+                            attempt.content,
+                            tuple(attempt.tools.values()),
+                            attempt.finish_reason,
+                            attempt_usage(attempt),
+                            attempt.provider_request_id or None,
+                            attempt.refusal or None,
+                        )
+                    if validation is not None and not validation.ok:
+                        outcome, validation, content = await self._repair(
+                            run, spec, outcome.content
+                        )
+                    if run.invocation.json_schema is not None:
+                        self._mark_sent(run)
+                        if outcome.refusal:
+                            yield GatewayEvent(
+                                kind=EventKind.REFUSAL, text=outcome.refusal
+                            )
+                        elif outcome.tool_calls:
+                            for tool in outcome.tool_calls:
+                                yield GatewayEvent(
+                                    kind=EventKind.TOOL_CALL, tool_call=tool
+                                )
+                        else:
+                            yield GatewayEvent(kind=EventKind.DELTA, text=content)
+                    elif outcome.refusal and not attempt.refusal_emitted:
+                        self._mark_sent(run)
+                        yield GatewayEvent(kind=EventKind.REFUSAL, text=outcome.refusal)
+                    result = self._result(run, spec, outcome, validation, content)
+                    self._recorder.record_call(run, result.terminal, result=result)
+                    yield GatewayEvent(
+                        kind=EventKind.DONE,
+                        finish_reason=result.finish_reason,
+                        usage=result.usage,
+                    )
+                    return
+                except GatewayError as error:
+                    if (
+                        await self._retry(
+                            run, error, tries, len(candidates) - index - 1
+                        )
+                        == "fallback"
+                    ):
+                        break
+        raise GatewayError(
+            Code.MODEL_UNAVAILABLE, "model temporarily unavailable", stage=Stage.ROUTING
         )
 
-    def _save_attempt(
-        self,
-        invocation: Invocation,
+    @staticmethod
+    def _mark_sent(run: CallState) -> None:
+        run.sent = True
+        if run.ttft_ms is None:
+            run.ttft_ms = (time.monotonic() - run.started) * 1000
+
+    @staticmethod
+    def _result(
+        run: CallState,
         spec: ModelSpec,
-        attempt: int,
-        *,
-        is_retry: bool,
-        is_fallback: bool,
-        queue_ms: float,
-        route_ms: float,
-        ttft_ms: float | None,
-        total_ms: float,
-        usage: TokenUsage,
-        finish_reason: str,
-        terminal: Terminal,
-        error_code: str,
-        provider_request_id: str,
-    ) -> None:
-        cost = price_usage(usage, spec)
-        generation = None if ttft_ms is None else max(0.0, total_ms - ttft_ms)
-        self._ledger.save_attempt(
-            AttemptRow(
-                call_id=invocation.call_id,
-                attempt=attempt,
-                provider=spec.provider,
-                resolved_model=spec.resolved_model,
-                is_retry=is_retry,
-                is_fallback=is_fallback,
-                queue_ms=queue_ms,
-                route_ms=route_ms,
-                ttft_ms=ttft_ms,
-                generation_ms=generation,
-                total_ms=total_ms,
-                timeout_budget_ms=invocation.timeout.total_seconds() * 1000,
-                finish_reason=finish_reason,
-                terminal=terminal.value,
-                error_code=error_code,
-                provider_request_id=provider_request_id,
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-                cached_tokens=usage.cached_tokens,
-                reasoning_tokens=usage.reasoning_tokens,
-                estimated=usage.estimated,
-                cost_input=str(cost.input),
-                cost_output=str(cost.output),
-                cost_cache=str(cost.cache),
-                cost_total=str(cost.total),
-            )
+        outcome: AdapterOutcome,
+        validation: ValidationResult | None,
+        content: str,
+    ) -> UnifiedResult:
+        # Both invoke and stream normalize usage before constructing a result.
+        assert outcome.usage is not None
+        return UnifiedResult(
+            run.invocation.requested_model,
+            spec.resolved_model,
+            spec.provider,
+            content,
+            outcome.tool_calls,
+            outcome.finish_reason,
+            Terminal.REFUSED if outcome.refusal else Terminal.COMPLETED,
+            outcome.usage,
+            validation,
+            outcome.provider_request_id,
+            outcome.refusal,
+        )
+
+    @staticmethod
+    def _upstream_call(
+        run: CallState, spec: ModelSpec, messages: tuple[Message, ...]
+    ) -> UpstreamCall:
+        invocation = run.invocation
+        return UpstreamCall(
+            invocation.requested_model,
+            spec.resolved_model,
+            spec.base_url,
+            messages,
+            invocation.max_tokens,
+            invocation.temperature,
+            invocation.json_schema,
+            invocation.tools,
+            timedelta(
+                seconds=max(
+                    0.001,
+                    min(run.deadline - time.monotonic(), spec.timeout.total_seconds()),
+                )
+            ),
+            invocation.tool_choice,
+            invocation.schema_name,
+            invocation.schema_description,
+            invocation.schema_strict,
         )
 
 
-def asyncio_timeout(delay: timedelta):
-    import asyncio
-
-    return asyncio.timeout(delay.total_seconds())
-
-
-def _upstream_call(
-    invocation: Invocation,
-    spec: ModelSpec,
-    messages: tuple[Message, ...] | None = None,
-) -> UpstreamCall:
-    return UpstreamCall(
-        requested_model=invocation.requested_model,
-        resolved_model=spec.resolved_model,
-        base_url=spec.base_url,
-        messages=invocation.messages if messages is None else messages,
-        max_tokens=invocation.max_tokens,
-        temperature=invocation.temperature,
-        json_schema=invocation.json_schema,
-        tools=invocation.tools,
-        timeout=min(invocation.timeout, spec.timeout),
+def _merge_tool(tools: dict[int, ToolCall], delta: ToolCall) -> None:
+    previous = tools.get(delta.index)
+    tools[delta.index] = (
+        delta
+        if previous is None
+        else ToolCall(
+            previous.id or delta.id,
+            previous.name + delta.name,
+            previous.arguments + delta.arguments,
+            delta.index,
+        )
     )
-
-
-def _spec_for(registry: AdapterRegistry, result: UnifiedResult) -> ModelSpec:
-    for spec in registry.specs:
-        if spec.provider == result.provider and spec.resolved_model == result.resolved_model:
-            return spec
-    return registry.specs[0]

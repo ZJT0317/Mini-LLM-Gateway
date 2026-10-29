@@ -1,0 +1,10 @@
+{
+  "status": "blocked_missing_configuration",
+  "measured_at": "2026-10-29T08:19:58.464388+00:00",
+  "missing": [
+    "UPSTREAM_BASE_URL or --base-url",
+    "UPSTREAM_MODEL or --model",
+    "OPENAI_API_KEY"
+  ],
+  "paid_requests_made": 0
+}

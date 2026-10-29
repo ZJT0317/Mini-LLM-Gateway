@@ -1,0 +1,471 @@
+{
+  "measured_at": "2026-10-29T08:20:51.942228+00:00",
+  "mode": "controlled_local_http",
+  "host": {
+    "os": "Darwin",
+    "release": "24.6.0",
+    "architecture": "arm64",
+    "python": "3.11.12",
+    "sqlite": "3.49.2",
+    "openai_sdk": "2.33.0",
+    "fastapi": "0.136.1",
+    "httpx": "0.28.1"
+  },
+  "notes": [
+    "Single process; official SDK -> real local HTTP gateway -> real local HTTP fixture.",
+    "Controlled fixed output; measures gateway overhead, not model inference capacity.",
+    "SDK retries disabled; latency excludes waiting for the client-side concurrency semaphore.",
+    "Database uses existing synchronous per-row commits; filesystem cache and host load affect results."
+  ],
+  "cases": [
+    {
+      "requests": 100,
+      "concurrency": 1,
+      "stream": false,
+      "success": 100,
+      "errors": {},
+      "elapsed_s": 0.2735,
+      "success_rps": 365.58,
+      "latency": {
+        "count": 100,
+        "p50_ms": 2.554,
+        "p95_ms": 3.492,
+        "p99_ms": 4.095,
+        "max_ms": 4.216
+      },
+      "ttft": {
+        "count": 0,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null,
+        "max_ms": null
+      },
+      "event_loop_lag": {
+        "count": 52,
+        "p50_ms": 0.161,
+        "p95_ms": 0.845,
+        "p99_ms": 1.703,
+        "max_ms": 1.703
+      },
+      "upstream_delay_ms": 0,
+      "upstream_peak_concurrency": 1,
+      "writes": {
+        "save_call": {
+          "count": 100,
+          "p50_ms": 0.347,
+          "p95_ms": 0.66,
+          "p99_ms": 1.055,
+          "max_ms": 1.059
+        },
+        "save_attempt": {
+          "count": 100,
+          "p50_ms": 0.376,
+          "p95_ms": 0.772,
+          "p99_ms": 0.948,
+          "max_ms": 1.275
+        },
+        "save_rejection": {
+          "count": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null,
+          "max_ms": null
+        }
+      }
+    },
+    {
+      "requests": 100,
+      "concurrency": 4,
+      "stream": false,
+      "success": 100,
+      "errors": {},
+      "elapsed_s": 0.277,
+      "success_rps": 360.99,
+      "latency": {
+        "count": 100,
+        "p50_ms": 9.589,
+        "p95_ms": 13.963,
+        "p99_ms": 35.581,
+        "max_ms": 36.159
+      },
+      "ttft": {
+        "count": 0,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null,
+        "max_ms": null
+      },
+      "event_loop_lag": {
+        "count": 43,
+        "p50_ms": 0.758,
+        "p95_ms": 3.204,
+        "p99_ms": 24.848,
+        "max_ms": 24.848
+      },
+      "upstream_delay_ms": 0,
+      "upstream_peak_concurrency": 1,
+      "writes": {
+        "save_call": {
+          "count": 100,
+          "p50_ms": 0.362,
+          "p95_ms": 0.698,
+          "p99_ms": 2.078,
+          "max_ms": 3.413
+        },
+        "save_attempt": {
+          "count": 100,
+          "p50_ms": 0.396,
+          "p95_ms": 0.764,
+          "p99_ms": 1.72,
+          "max_ms": 1.908
+        },
+        "save_rejection": {
+          "count": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null,
+          "max_ms": null
+        }
+      }
+    },
+    {
+      "requests": 100,
+      "concurrency": 16,
+      "stream": false,
+      "success": 100,
+      "errors": {},
+      "elapsed_s": 0.3649,
+      "success_rps": 274.06,
+      "latency": {
+        "count": 100,
+        "p50_ms": 53.113,
+        "p95_ms": 85.201,
+        "p99_ms": 100.028,
+        "max_ms": 101.179
+      },
+      "ttft": {
+        "count": 0,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null,
+        "max_ms": null
+      },
+      "event_loop_lag": {
+        "count": 42,
+        "p50_ms": 3.364,
+        "p95_ms": 5.115,
+        "p99_ms": 16.406,
+        "max_ms": 16.406
+      },
+      "upstream_delay_ms": 0,
+      "upstream_peak_concurrency": 3,
+      "writes": {
+        "save_call": {
+          "count": 100,
+          "p50_ms": 0.38,
+          "p95_ms": 0.588,
+          "p99_ms": 0.86,
+          "max_ms": 3.268
+        },
+        "save_attempt": {
+          "count": 100,
+          "p50_ms": 0.464,
+          "p95_ms": 0.732,
+          "p99_ms": 0.969,
+          "max_ms": 7.629
+        },
+        "save_rejection": {
+          "count": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null,
+          "max_ms": null
+        }
+      }
+    },
+    {
+      "requests": 100,
+      "concurrency": 1,
+      "stream": false,
+      "success": 100,
+      "errors": {},
+      "elapsed_s": 2.7631,
+      "success_rps": 36.19,
+      "latency": {
+        "count": 100,
+        "p50_ms": 26.58,
+        "p95_ms": 35.123,
+        "p99_ms": 41.516,
+        "max_ms": 43.209
+      },
+      "ttft": {
+        "count": 0,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null,
+        "max_ms": null
+      },
+      "event_loop_lag": {
+        "count": 485,
+        "p50_ms": 0.649,
+        "p95_ms": 1.632,
+        "p99_ms": 4.874,
+        "max_ms": 13.222
+      },
+      "upstream_delay_ms": 20,
+      "upstream_peak_concurrency": 1,
+      "writes": {
+        "save_call": {
+          "count": 100,
+          "p50_ms": 0.552,
+          "p95_ms": 1.518,
+          "p99_ms": 7.608,
+          "max_ms": 9.591
+        },
+        "save_attempt": {
+          "count": 100,
+          "p50_ms": 0.881,
+          "p95_ms": 2.933,
+          "p99_ms": 7.231,
+          "max_ms": 14.818
+        },
+        "save_rejection": {
+          "count": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null,
+          "max_ms": null
+        }
+      }
+    },
+    {
+      "requests": 100,
+      "concurrency": 4,
+      "stream": false,
+      "success": 100,
+      "errors": {},
+      "elapsed_s": 0.8419,
+      "success_rps": 118.77,
+      "latency": {
+        "count": 100,
+        "p50_ms": 33.06,
+        "p95_ms": 35.533,
+        "p99_ms": 37.101,
+        "max_ms": 38.023
+      },
+      "ttft": {
+        "count": 0,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null,
+        "max_ms": null
+      },
+      "event_loop_lag": {
+        "count": 150,
+        "p50_ms": 0.655,
+        "p95_ms": 1.342,
+        "p99_ms": 2.289,
+        "max_ms": 2.501
+      },
+      "upstream_delay_ms": 20,
+      "upstream_peak_concurrency": 4,
+      "writes": {
+        "save_call": {
+          "count": 100,
+          "p50_ms": 0.386,
+          "p95_ms": 0.494,
+          "p99_ms": 0.535,
+          "max_ms": 0.67
+        },
+        "save_attempt": {
+          "count": 100,
+          "p50_ms": 0.43,
+          "p95_ms": 0.65,
+          "p99_ms": 0.735,
+          "max_ms": 0.865
+        },
+        "save_rejection": {
+          "count": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null,
+          "max_ms": null
+        }
+      }
+    },
+    {
+      "requests": 100,
+      "concurrency": 16,
+      "stream": false,
+      "success": 100,
+      "errors": {},
+      "elapsed_s": 0.3031,
+      "success_rps": 329.95,
+      "latency": {
+        "count": 100,
+        "p50_ms": 43.392,
+        "p95_ms": 63.505,
+        "p99_ms": 69.533,
+        "max_ms": 70.736
+      },
+      "ttft": {
+        "count": 0,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null,
+        "max_ms": null
+      },
+      "event_loop_lag": {
+        "count": 47,
+        "p50_ms": 1.09,
+        "p95_ms": 3.876,
+        "p99_ms": 5.324,
+        "max_ms": 5.324
+      },
+      "upstream_delay_ms": 20,
+      "upstream_peak_concurrency": 16,
+      "writes": {
+        "save_call": {
+          "count": 100,
+          "p50_ms": 0.338,
+          "p95_ms": 0.483,
+          "p99_ms": 0.67,
+          "max_ms": 4.522
+        },
+        "save_attempt": {
+          "count": 100,
+          "p50_ms": 0.358,
+          "p95_ms": 0.639,
+          "p99_ms": 1.1,
+          "max_ms": 1.771
+        },
+        "save_rejection": {
+          "count": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null,
+          "max_ms": null
+        }
+      }
+    },
+    {
+      "requests": 20,
+      "concurrency": 1,
+      "stream": true,
+      "success": 20,
+      "errors": {},
+      "elapsed_s": 0.7575,
+      "success_rps": 26.4,
+      "latency": {
+        "count": 20,
+        "p50_ms": 37.109,
+        "p95_ms": 40.618,
+        "p99_ms": 42.2,
+        "max_ms": 42.2
+      },
+      "ttft": {
+        "count": 20,
+        "p50_ms": 23.998,
+        "p95_ms": 24.963,
+        "p99_ms": 25.06,
+        "max_ms": 25.06
+      },
+      "event_loop_lag": {
+        "count": 137,
+        "p50_ms": 0.505,
+        "p95_ms": 0.992,
+        "p99_ms": 2.413,
+        "max_ms": 2.637
+      },
+      "upstream_delay_ms": 20
+    },
+    {
+      "requests": 20,
+      "concurrency": 4,
+      "stream": true,
+      "success": 20,
+      "errors": {},
+      "elapsed_s": 0.2162,
+      "success_rps": 92.51,
+      "latency": {
+        "count": 20,
+        "p50_ms": 42.208,
+        "p95_ms": 46.343,
+        "p99_ms": 46.974,
+        "max_ms": 46.974
+      },
+      "ttft": {
+        "count": 20,
+        "p50_ms": 26.64,
+        "p95_ms": 29.712,
+        "p99_ms": 29.869,
+        "max_ms": 29.869
+      },
+      "event_loop_lag": {
+        "count": 39,
+        "p50_ms": 0.572,
+        "p95_ms": 2.359,
+        "p99_ms": 4.565,
+        "max_ms": 4.565
+      },
+      "upstream_delay_ms": 20
+    }
+  ],
+  "admission_burst": {
+    "requests": 32,
+    "concurrency": 32,
+    "stream": false,
+    "success": 4,
+    "errors": {
+      "429": 28
+    },
+    "elapsed_s": 0.1294,
+    "success_rps": 30.91,
+    "latency": {
+      "count": 4,
+      "p50_ms": 127.448,
+      "p95_ms": 128.995,
+      "p99_ms": 128.995,
+      "max_ms": 128.995
+    },
+    "ttft": {
+      "count": 0,
+      "p50_ms": null,
+      "p95_ms": null,
+      "p99_ms": null,
+      "max_ms": null
+    },
+    "event_loop_lag": {
+      "count": 17,
+      "p50_ms": 0.678,
+      "p95_ms": 21.074,
+      "p99_ms": 21.074,
+      "max_ms": 21.074
+    },
+    "configured_limit": 4,
+    "upstream_peak_concurrency": 4
+  },
+  "persistence": {
+    "calls": 650,
+    "attempts": 650,
+    "reopened_calls": 650,
+    "duplicate_attempt_pairs": 0
+  },
+  "database_write_benchmark": {
+    "request_pairs": 500,
+    "row_writes": 1000,
+    "commits": 1000,
+    "pairs_per_second": 1626.78,
+    "rows_per_second": 3253.56,
+    "pair_latency": {
+      "count": 500,
+      "p50_ms": 0.587,
+      "p95_ms": 0.78,
+      "p99_ms": 0.974,
+      "max_ms": 1.494
+    },
+    "journal_mode": "delete",
+    "synchronous": 2,
+    "database_bytes": 225280
+  }
+}

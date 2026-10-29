@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Checks / Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: "0.11.11"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Verify lock and install development dependencies
+        run: |
+          uv lock --check
+          uv sync --locked --extra dev
+      - name: Lint
+        run: uv run --locked --extra dev ruff check app tests scripts
+      - name: Type check
+        run: uv run --locked --extra dev mypy
+      - name: Test
+        run: uv run --locked --extra dev pytest -q
+
+  container:
+    name: Docker build and CLI smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build locked runtime image
+        run: docker build --tag mini-llm-gateway:ci .
+      - name: Check packaged CLI
+        run: docker run --rm mini-llm-gateway:ci mini-llm-gateway --help
+      - name: Validate Compose configuration
+        env:
+          OPENAI_API_KEY: ci-placeholder
+          GATEWAY_DEMO_KEY: ci-placeholder
+        run: |
+          cp gateway.example.yaml gateway.yaml
+          docker compose config --quiet
