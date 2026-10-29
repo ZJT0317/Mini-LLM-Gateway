@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
+from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
+from jsonschema import ValidationError
 
 from app.core.errors import Code, GatewayError, Stage
 from app.core.models import (
@@ -20,6 +22,7 @@ from app.core.models import (
     ToolSpec,
     estimate_tokens,
 )
+from app.services.structured import check_schema
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,10 @@ class PreparedCall:
 class PromptLibrary:
     def __init__(self, bundles: tuple[PromptBundle, ...]) -> None:
         self._bundles = {(item.name, item.version): item for item in bundles}
+        if len(self._bundles) != len(bundles):
+            raise ValueError("prompt names and versions must be unique")
+        for bundle in bundles:
+            check_schema(bundle.variable_schema)
 
     def get(self, name: str, version: str) -> PromptBundle | None:
         return self._bundles.get((name, version))
@@ -87,22 +94,19 @@ class PromptLibrary:
                 "prompt variable rejected",
                 stage=Stage.PROMPT,
             )
-        updated = Invocation(
-            call_id=invocation.call_id,
-            trace_id=invocation.trace_id,
+        updated = replace(
+            invocation,
             requested_model=model,
             messages=rendered,
             required=frozenset(required),
-            max_tokens=invocation.max_tokens if invocation.max_tokens is not None else bundle.max_tokens,
-            temperature=invocation.temperature if invocation.temperature is not None else bundle.temperature,
+            max_tokens=invocation.max_tokens
+            if invocation.max_tokens is not None
+            else bundle.max_tokens,
+            temperature=invocation.temperature
+            if invocation.temperature is not None
+            else bundle.temperature,
             json_schema=schema,
             tools=tools,
-            prompt_ref=invocation.prompt_ref,
-            timeout=invocation.timeout,
-            tenant_id=invocation.tenant_id,
-            key_id=invocation.key_id,
-            run_id=invocation.run_id,
-            step_id=invocation.step_id,
         )
         use = PromptUse(
             name=bundle.name,
@@ -117,7 +121,9 @@ class PromptLibrary:
         _check_variables(bundle.variable_schema, ref.variables)
         system = _render(bundle.system_template, ref.variables)
         messages = (Message("system", system),) + bundle.few_shot
-        use = PromptUse(bundle.name, bundle.version, bundle.content_hash, bundle.schema_version)
+        use = PromptUse(
+            bundle.name, bundle.version, bundle.content_hash, bundle.schema_version
+        )
         return messages, use
 
     def _require(self, ref: PromptRef) -> PromptBundle:
@@ -143,7 +149,8 @@ def load_prompts(directory: Path) -> PromptLibrary:
 
 def _bundle(raw: dict) -> PromptBundle:
     few_shot = tuple(
-        Message(str(item["role"]), str(item["content"])) for item in raw.get("few_shot") or []
+        Message(str(item["role"]), str(item["content"]))
+        for item in raw.get("few_shot") or []
     )
     tools = tuple(
         ToolSpec(
@@ -156,14 +163,18 @@ def _bundle(raw: dict) -> PromptBundle:
     system = str(raw.get("system") or "")
     fingerprint = hashlib.sha256()
     fingerprint.update(system.encode("utf-8"))
-    fingerprint.update(json.dumps([(item.role, item.content) for item in few_shot]).encode("utf-8"))
+    fingerprint.update(
+        json.dumps([(item.role, item.content) for item in few_shot]).encode("utf-8")
+    )
     threshold = raw.get("eval_threshold")
     return PromptBundle(
         name=str(raw["name"]),
         version=str(raw["version"]),
         status=str(raw.get("status") or "draft"),
         system_template=system,
-        variable_schema=dict(raw.get("variables") or {"type": "object", "properties": {}}),
+        variable_schema=dict(
+            raw.get("variables") or {"type": "object", "properties": {}}
+        ),
         few_shot=few_shot,
         output_schema=raw.get("output_schema"),
         tools=tools,
@@ -180,32 +191,19 @@ def _bundle(raw: dict) -> PromptBundle:
 
 
 def _check_variables(schema: dict, variables: dict) -> None:
-    properties = schema.get("properties") or {}
-    required = schema.get("required") or []
-    for name in required:
-        if name not in variables:
-            raise GatewayError(Code.PROMPT_INVALID, "prompt variable rejected", stage=Stage.PROMPT)
-    for name, value in variables.items():
-        spec = properties.get(name)
-        if spec is None:
-            raise GatewayError(Code.PROMPT_INVALID, "prompt variable rejected", stage=Stage.PROMPT)
-        kind = spec.get("type")
-        if kind == "string":
-            if not isinstance(value, str):
-                raise GatewayError(Code.PROMPT_INVALID, "prompt variable rejected", stage=Stage.PROMPT)
-            max_length = spec.get("maxLength")
-            if max_length is not None and len(value) > int(max_length):
-                raise GatewayError(Code.PROMPT_INVALID, "prompt variable rejected", stage=Stage.PROMPT)
-        elif kind == "integer" and (isinstance(value, bool) or not isinstance(value, int)):
-            raise GatewayError(Code.PROMPT_INVALID, "prompt variable rejected", stage=Stage.PROMPT)
-        elif kind == "number" and not isinstance(value, (int, float)):
-            raise GatewayError(Code.PROMPT_INVALID, "prompt variable rejected", stage=Stage.PROMPT)
-        elif kind == "boolean" and not isinstance(value, bool):
-            raise GatewayError(Code.PROMPT_INVALID, "prompt variable rejected", stage=Stage.PROMPT)
+    try:
+        check_schema(schema).validate(variables)
+    except (ValidationError, GatewayError) as exc:
+        raise GatewayError(
+            Code.PROMPT_INVALID,
+            "prompt variable rejected",
+            stage=Stage.PROMPT,
+            cause=exc,
+        ) from exc
 
 
 def _render(template: str, variables: dict) -> str:
-    environment = SandboxedEnvironment(autoescape=False)
+    environment = SandboxedEnvironment(autoescape=False, undefined=StrictUndefined)
     environment.filters.clear()
     environment.globals.clear()
     try:

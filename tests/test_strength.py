@@ -28,7 +28,7 @@ def test_nested_schema_accepts_a_matching_object():
     )
     assert result.ok
     assert '"name": "ada"' in canonical
-    assert '"ratio": 1.0' in canonical
+    assert '"ratio": 1' in canonical
 
 
 def test_nested_schema_rejects_shape_type_and_format_errors():
@@ -44,9 +44,10 @@ def test_nested_schema_rejects_shape_type_and_format_errors():
         assert not result.ok, sample
 
 
-def test_composition_schemas_do_not_pass_silently():
-    result, _ = validate_json('{"name": "ada"}', {"oneOf": [{"type": "object"}]})
-    assert not result.ok
+def test_composition_schemas_are_evaluated():
+    schema = {"oneOf": [{"type": "object"}, {"type": "string"}]}
+    assert validate_json('{"name": "ada"}', schema)[0].ok
+    assert not validate_json('[]', schema)[0].ok
 
 
 def test_metrics_percentile_uses_recorded_samples():

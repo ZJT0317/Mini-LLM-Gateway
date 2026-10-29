@@ -4,47 +4,48 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
-import secrets
-from collections.abc import Callable
+import math
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
+from app.api.middleware import RequestContextMiddleware
 from app.api.routes import build_router
 from app.config import Settings, load_settings
 from app.core.admission import AdmissionGate
 from app.core.errors import Code, GatewayError, http_status
-from app.core.models import APIKey, PromptRef
-from app.services.gateway import GatewayService
+from app.core.models import APIKey, Message, ModelAdapter, PromptRef, PromptUse
+from app.services.gateway import GatewayService, Sleeper
 from app.services.metrics import Metrics
 from app.services.prompts import PromptLibrary, load_prompts
 from app.services.router import AdapterRegistry, HealthBoard, Router
 from app.services.upstream import OpenAIAdapter
 from app.services.usage import Ledger
 
-_TRACE = re.compile(r"[A-Za-z0-9_-]{1,64}")
-
 
 def create_app(
     settings: Settings,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
-    sleeper: Callable | None = None,
+    sleeper: Sleeper | None = None,
     rng: Callable[[], float] | None = None,
     clock: Callable[[], datetime] | None = None,
     prompts: PromptLibrary | None = None,
 ) -> FastAPI:
     ledger = Ledger(settings.server.database)
-    health = HealthBoard()
+    health = HealthBoard(
+        settings.limits.circuit_failure_threshold,
+        settings.limits.circuit_cooldown.total_seconds(),
+    )
     clients: list[httpx.AsyncClient] = []
-    adapters = {}
+    adapters: dict[str, ModelAdapter] = {}
     for provider in settings.providers:
         client = httpx.AsyncClient(
             transport=transport,
@@ -59,7 +60,9 @@ def create_app(
         )
     registry = AdapterRegistry(settings.models, adapters)
     metrics = Metrics()
-    library = prompts if prompts is not None else load_prompts(settings.prompts_directory)
+    library = (
+        prompts if prompts is not None else load_prompts(settings.prompts_directory)
+    )
     gateway = GatewayService(
         prompts=library,
         admission=AdmissionGate(),
@@ -78,7 +81,7 @@ def create_app(
     keys = {item.secret_hash: item for item in settings.keys}
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
         for client in clients:
             await client.aclose()
@@ -90,41 +93,23 @@ def create_app(
     app.state.metrics = metrics
     app.state.gateway = gateway
 
-    @app.middleware("http")
-    async def observe(request: Request, call_next):
-        incoming = request.headers.get("x-request-id", "")
-        request.state.trace_id = incoming if _TRACE.fullmatch(incoming or "") else secrets.token_hex(8)
-        request.state.run_id = request.headers.get("x-run-id", "")
-        request.state.step_id = request.headers.get("x-step-id", "")
-        length = request.headers.get("content-length")
-        if length and length.isdigit() and int(length) > settings.server.max_body_bytes:
-            return _error_response(
-                request.state.trace_id,
-                400,
-                "invalid_request_error",
-                "invalid_request",
-                "request body is too large",
-            )
-        response = await call_next(request)
-        response.headers["X-Request-Id"] = request.state.trace_id
-        logging.getLogger("gateway.access").info(
-            "request_id=%s method=%s path=%s status=%s",
-            request.state.trace_id,
-            request.method,
-            request.url.path,
-            response.status_code,
-        )
-        return response
+    app.add_middleware(
+        RequestContextMiddleware, max_body_bytes=settings.server.max_body_bytes
+    )
 
     @app.exception_handler(GatewayError)
-    async def on_gateway_error(request: Request, exc: GatewayError):
+    async def on_gateway_error(request: Request, exc: GatewayError) -> Response:
         if exc.code is Code.CANCELED:
-            return JSONResponse(status_code=204, content=None, headers={"X-Request-Id": _trace(request)})
+            return Response(status_code=204, headers={"X-Request-Id": _trace(request)})
         status, error_type, message = http_status(exc)
-        return _error_response(_trace(request), status, error_type, exc.code.value, message)
+        return _error_response(
+            _trace(request), status, error_type, exc.code.value, message
+        )
 
     @app.exception_handler(RequestValidationError)
-    async def on_validation_error(request: Request, exc: RequestValidationError):
+    async def on_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
         detail = exc.errors()[0]["msg"] if exc.errors() else "invalid request"
         return _error_response(
             _trace(request),
@@ -141,7 +126,7 @@ def create_app(
             names = tuple(name for name in names if name in allowed)
         return names
 
-    def render(ref: PromptRef):
+    def render(ref: PromptRef) -> tuple[tuple[Message, ...], PromptUse]:
         return library.render_only(ref)
 
     app.include_router(
@@ -150,7 +135,9 @@ def create_app(
     return app
 
 
-def _error_response(trace_id: str, status: int, error_type: str, code: str, message: str) -> JSONResponse:
+def _error_response(
+    trace_id: str, status: int, error_type: str, code: str, message: str
+) -> JSONResponse:
     return JSONResponse(
         status_code=status,
         content={
@@ -165,7 +152,7 @@ def _trace(request: Request) -> str:
     return getattr(request.state, "trace_id", "")
 
 
-async def _sleep(delay) -> None:
+async def _sleep(delay: timedelta) -> None:
     import asyncio
 
     await asyncio.sleep(delay.total_seconds())
@@ -182,12 +169,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", default="gateway.yaml")
     args = parser.parse_args(argv)
     settings = load_settings(Path(args.config))
-    logging.basicConfig(level=getattr(logging, settings.log.level.upper(), logging.INFO))
+    logging.basicConfig(
+        level=getattr(logging, settings.log.level.upper(), logging.INFO)
+    )
     uvicorn.run(
         create_app(settings),
         host=settings.server.host,
         port=settings.server.port,
-        timeout_graceful_shutdown=settings.server.shutdown_grace.total_seconds(),
+        timeout_graceful_shutdown=math.ceil(
+            settings.server.shutdown_grace.total_seconds()
+        ),
     )
 
 

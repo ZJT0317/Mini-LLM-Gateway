@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -30,6 +31,8 @@ class LimitSettings:
     max_tokens_cap: int
     retry_max_attempts: int
     repair_max_attempts: int
+    circuit_failure_threshold: int = 3
+    circuit_cooldown: timedelta = timedelta(seconds=30)
 
 
 @dataclass(frozen=True)
@@ -67,12 +70,16 @@ def load_settings(path: Path) -> Settings:
     log_raw = raw.get("log") or {}
     host, port = _split_addr(str(server_raw.get("addr") or "0.0.0.0:8080"))
     gateway_timeout = _duration(server_raw.get("gateway_timeout") or "60s")
-    providers = tuple(_provider(item, gateway_timeout) for item in raw.get("providers") or [])
+    providers = tuple(
+        _provider(item, gateway_timeout) for item in raw.get("providers") or []
+    )
     provider_by_name = {item.name: item for item in providers}
     if len(provider_by_name) != len(providers):
         raise ValueError("provider names must be unique")
     models = tuple(_model(item, provider_by_name) for item in raw.get("models") or [])
-    route_keys = [(item.logical_model, item.provider, item.resolved_model) for item in models]
+    route_keys = [
+        (item.logical_model, item.provider, item.resolved_model) for item in models
+    ]
     if len(route_keys) != len(set(route_keys)):
         raise ValueError("model routes must be unique")
     keys = tuple(_key(item) for item in raw.get("keys") or [])
@@ -83,20 +90,30 @@ def load_settings(path: Path) -> Settings:
     directory = Path(prompts.get("directory") or path.parent / "prompts")
     if "directory" in prompts and not directory.exists():
         raise ValueError(f"prompt directory does not exist: {directory}")
-    database = Path(server_raw.get("database") or path.parent / "gateway.db")
+    database = Path(
+        os.environ.get("GATEWAY_DATABASE")
+        or server_raw.get("database")
+        or path.parent / "gateway.db"
+    )
     return Settings(
         server=ServerSettings(
             host=host,
             port=port,
             gateway_timeout=gateway_timeout,
-            max_body_bytes=int(server_raw.get("max_body_bytes") or 1_048_576),
+            max_body_bytes=_integer(server_raw, "max_body_bytes", 1_048_576),
             shutdown_grace=_duration(server_raw.get("shutdown_grace") or "15s"),
             database=database,
         ),
         limits=LimitSettings(
-            max_tokens_cap=int(limits_raw.get("max_tokens_cap") or 4096),
-            retry_max_attempts=int(limits_raw.get("retry_max_attempts") or 2),
-            repair_max_attempts=int(limits_raw.get("repair_max_attempts") or 1),
+            max_tokens_cap=_integer(limits_raw, "max_tokens_cap", 4096),
+            retry_max_attempts=_integer(limits_raw, "retry_max_attempts", 2),
+            repair_max_attempts=_integer(
+                limits_raw, "repair_max_attempts", 1, minimum=0
+            ),
+            circuit_failure_threshold=_integer(
+                limits_raw, "circuit_failure_threshold", 3
+            ),
+            circuit_cooldown=_duration(limits_raw.get("circuit_cooldown", "30s")),
         ),
         log=LogSettings(
             level=str(log_raw.get("level") or "info"),
@@ -120,10 +137,21 @@ def _split_addr(addr: str) -> tuple[str, int]:
 def _duration(value: object) -> timedelta:
     text = str(value).strip()
     if text.endswith("ms"):
-        return timedelta(milliseconds=float(text[:-2]))
-    if text.endswith("s"):
-        return timedelta(seconds=float(text[:-1]))
-    raise ValueError(f"unsupported duration: {value}")
+        seconds = float(text[:-2]) / 1000
+    elif text.endswith("s"):
+        seconds = float(text[:-1])
+    else:
+        raise ValueError(f"unsupported duration: {value}")
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("durations must be finite and positive")
+    return timedelta(seconds=seconds)
+
+
+def _integer(raw: dict, name: str, default: int, *, minimum: int = 1) -> int:
+    value = raw.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return value
 
 
 def _provider(raw: dict, gateway_timeout: timedelta) -> ProviderSettings:
@@ -133,7 +161,9 @@ def _provider(raw: dict, gateway_timeout: timedelta) -> ProviderSettings:
     _check_url(base_url, allowed)
     timeout = _duration(raw.get("upstream_timeout") or "90s")
     if gateway_timeout >= timeout:
-        raise ValueError(f"{name}: gateway_timeout must be shorter than upstream_timeout")
+        raise ValueError(
+            f"{name}: gateway_timeout must be shorter than upstream_timeout"
+        )
     api_key = os.environ.get(str(raw["api_key_env"]), "")
     if not api_key:
         raise ValueError(f"missing environment variable {raw['api_key_env']}")

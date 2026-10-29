@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -19,14 +19,17 @@ class Capability(StrEnum):
 
 class Terminal(StrEnum):
     COMPLETED = "completed"
+    REFUSED = "refused"
     ERROR = "error"
     CANCELED = "canceled"
 
 
 class EventKind(StrEnum):
     DELTA = "delta"
+    REFUSAL = "refusal"
     TOOL_CALL = "tool_call"
     USAGE = "usage"
+    FINISH = "finish"
     DONE = "done"
     ERROR = "error"
 
@@ -34,7 +37,9 @@ class EventKind(StrEnum):
 @dataclass(frozen=True)
 class Message:
     role: str
-    content: str
+    content: str | None
+    tool_calls: tuple[ToolCall, ...] = ()
+    tool_call_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,7 @@ class ToolCall:
     id: str
     name: str
     arguments: str
+    index: int = 0
 
 
 @dataclass(frozen=True)
@@ -75,7 +81,7 @@ class Invocation:
     required: frozenset[Capability]
     max_tokens: int | None
     temperature: float | None
-    json_schema: dict | None
+    json_schema: dict | bool | None
     tools: tuple[ToolSpec, ...]
     prompt_ref: PromptRef | None
     timeout: timedelta
@@ -83,6 +89,12 @@ class Invocation:
     key_id: str
     run_id: str = ""
     step_id: str = ""
+    tool_choice: str | dict | None = None
+    schema_name: str = "response"
+    schema_description: str | None = None
+    schema_strict: bool | None = None
+    include_usage: bool = False
+    created: int = 0
 
 
 @dataclass(frozen=True)
@@ -116,6 +128,7 @@ class UnifiedResult:
     usage: TokenUsage
     validation: ValidationResult | None
     provider_request_id: str | None
+    refusal: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,9 +139,13 @@ class UpstreamCall:
     messages: tuple[Message, ...]
     max_tokens: int | None
     temperature: float | None
-    json_schema: dict | None
+    json_schema: dict | bool | None
     tools: tuple[ToolSpec, ...]
     timeout: timedelta
+    tool_choice: str | dict | None = None
+    schema_name: str = "response"
+    schema_description: str | None = None
+    schema_strict: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +155,7 @@ class AdapterOutcome:
     finish_reason: str
     usage: TokenUsage | None
     provider_request_id: str | None
+    refusal: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +165,9 @@ class GatewayEvent:
     tool_call: ToolCall | None = None
     usage: TokenUsage | None = None
     error: object | None = None
+    finish_reason: str | None = None
+    provider_request_id: str | None = None
+    requested_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -202,12 +223,24 @@ class ModelAdapter(Protocol):
 
     async def invoke(self, call: UpstreamCall) -> AdapterOutcome: ...
 
-    def stream(self, call: UpstreamCall) -> AsyncIterator[GatewayEvent]: ...
+    def stream(self, call: UpstreamCall) -> AsyncGenerator[GatewayEvent, None]: ...
 
 
 def estimate_tokens(messages: tuple[Message, ...], completion: str) -> TokenUsage:
     """Approximate usage when the upstream omits it. Not a model tokenizer."""
-    prompt = sum(4 + math.ceil(len(message.content) / 4) for message in messages)
+    prompt = sum(
+        4
+        + math.ceil(
+            (
+                len(message.content or "")
+                + sum(
+                    len(call.name) + len(call.arguments) for call in message.tool_calls
+                )
+            )
+            / 4
+        )
+        for message in messages
+    )
     completion_tokens = math.ceil(len(completion) / 4) if completion else 0
     return TokenUsage(
         input_tokens=prompt,

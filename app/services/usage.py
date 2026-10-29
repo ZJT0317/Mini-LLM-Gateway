@@ -35,6 +35,8 @@ class AttemptRow:
     cost_output: str
     cost_cache: str
     cost_total: str
+    kind: str = "generation"
+    output_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,15 @@ class Ledger:
                 );
                 """
             )
+            self._add_column("attempts", "kind", "TEXT DEFAULT 'generation'")
+            self._add_column("attempts", "output_hash", "TEXT DEFAULT ''")
+            self._conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS calls_trace_idx ON calls(trace_id);
+                CREATE INDEX IF NOT EXISTS attempts_call_idx ON attempts(call_id, attempt);
+                CREATE INDEX IF NOT EXISTS rejections_call_idx ON rejections(call_id);
+                """
+            )
             self._conn.commit()
 
     def save_call(self, row: CallRow) -> None:
@@ -203,8 +214,8 @@ class Ledger:
                     queue_ms, route_ms, ttft_ms, generation_ms, total_ms, timeout_budget_ms,
                     finish_reason, terminal, error_code, provider_request_id,
                     input_tokens, output_tokens, cached_tokens, reasoning_tokens, estimated,
-                    cost_input, cost_output, cost_cache, cost_total
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cost_input, cost_output, cost_cache, cost_total, kind, output_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row.call_id,
@@ -232,11 +243,15 @@ class Ledger:
                     row.cost_output,
                     row.cost_cache,
                     row.cost_total,
+                    row.kind,
+                    row.output_hash,
                 ),
             )
             self._conn.commit()
 
-    def save_rejection(self, call_id: str, provider: str, resolved_model: str, reason: str) -> None:
+    def save_rejection(
+        self, call_id: str, provider: str, resolved_model: str, reason: str
+    ) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO rejections (call_id, provider, resolved_model, reason) VALUES (?, ?, ?, ?)",
@@ -246,7 +261,11 @@ class Ledger:
 
     def calls_by_trace(self, trace_id: str) -> list[sqlite3.Row]:
         with self._lock:
-            return list(self._conn.execute("SELECT * FROM calls WHERE trace_id = ?", (trace_id,)))
+            return list(
+                self._conn.execute(
+                    "SELECT * FROM calls WHERE trace_id = ?", (trace_id,)
+                )
+            )
 
     def attempts_for(self, call_id: str) -> list[sqlite3.Row]:
         with self._lock:
@@ -259,7 +278,11 @@ class Ledger:
 
     def rejections_for(self, call_id: str) -> list[sqlite3.Row]:
         with self._lock:
-            return list(self._conn.execute("SELECT * FROM rejections WHERE call_id = ?", (call_id,)))
+            return list(
+                self._conn.execute(
+                    "SELECT * FROM rejections WHERE call_id = ?", (call_id,)
+                )
+            )
 
     def _add_column(self, table: str, name: str, declaration: str) -> None:
         found = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}

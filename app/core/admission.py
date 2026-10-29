@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 
 
 MIN_BUDGET = timedelta(seconds=1)
+Release = Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,7 @@ class AdmissionGate:
         rpm: int,
         limit: int,
         now: datetime,
-    ) -> tuple[str, Callable[[], Awaitable[None]] | None]:
+    ) -> tuple[str, Release | None]:
         async with self._lock:
             inflight = self._inflight.get(key_id, 0)
             if inflight >= limit:

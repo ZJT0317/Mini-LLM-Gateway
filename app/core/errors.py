@@ -11,6 +11,7 @@ class Code(StrEnum):
     INVALID_REQUEST = "invalid_request"
     PROMPT_INVALID = "prompt_invalid"
     NO_COMPATIBLE_MODEL = "no_compatible_model"
+    MODEL_UNAVAILABLE = "model_unavailable"
     ADMISSION_REJECTED = "admission_rejected"
     DEADLINE_TOO_SHORT = "deadline_too_short"
     UPSTREAM_UNAVAILABLE = "upstream_unavailable"
@@ -70,6 +71,7 @@ def http_status(error: GatewayError) -> tuple[int, str, str]:
         Code.UNAUTHENTICATED: (401, "authentication_error", "invalid api key"),
         Code.KEY_DISABLED: (403, "permission_error", "api key disabled"),
         Code.NO_COMPATIBLE_MODEL: (404, "invalid_request_error", "model not found"),
+        Code.MODEL_UNAVAILABLE: (503, "upstream_error", "model temporarily unavailable"),
         Code.ADMISSION_REJECTED: (429, "rate_limit_error", error.message),
         Code.DEADLINE_TOO_SHORT: (429, "rate_limit_error", "deadline too short"),
         Code.UPSTREAM_UNAVAILABLE: (502, "upstream_error", "upstream request failed"),
